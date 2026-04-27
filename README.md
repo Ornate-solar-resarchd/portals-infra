@@ -33,7 +33,7 @@ concurrency:
 
 jobs:
   deploy:
-    uses: ResarchandDornate/portals-infra/.github/workflows/_deploy-template.yml@main
+    uses: Ornate-solar-resarchd/portals-infra/.github/workflows/_deploy-template.yml@main
     with:
       portal:       <short-name>
       portal_dir:   <folder-under-~/portals/>
