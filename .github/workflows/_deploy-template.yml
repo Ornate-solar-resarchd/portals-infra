@@ -1,0 +1,145 @@
+name: Deploy Portal Template
+
+# Reusable workflow called from each portal repo's deploy.yml.
+# All shared logic (Docker keychain shim, PATH fixup, logging, health check)
+# lives here. To change deploy behavior across all portals, edit this file.
+
+on:
+  workflow_call:
+    inputs:
+      portal:
+        description: "Short portal name (used for log filenames, e.g. compliance)"
+        required: true
+        type: string
+      portal_dir:
+        description: "Folder name under ~/portals/ to git pull (e.g. oem_compliance_portal)"
+        required: true
+        type: string
+      services:
+        description: "Space-separated docker compose service names to rebuild"
+        required: true
+        type: string
+      health_url:
+        description: "URL to curl for health check (200/301/302 = pass)"
+        required: true
+        type: string
+      runner_label:
+        description: "Self-hosted runner label to target (e.g. compliance)"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - ${{ inputs.runner_label }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy
+        shell: bash
+        env:
+          # Force a clean Docker config dir — runner runs as launchd LaunchAgent
+          # and can't access the user keychain. This isolates from user config.
+          DOCKER_CONFIG: /Users/ornateserver/.docker-runner
+          PORTAL: ${{ inputs.portal }}
+          PORTAL_DIR: ${{ inputs.portal_dir }}
+          SERVICES: ${{ inputs.services }}
+          HEALTH_URL: ${{ inputs.health_url }}
+        run: |
+          set -e
+
+          # launchd LaunchAgents get a sparse PATH — restore Docker, brew, system bins
+          export PATH="/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+          # Empty Docker config so credsStore is unset
+          mkdir -p "$DOCKER_CONFIG/cli-plugins" "$DOCKER_CONFIG/bin"
+          echo '{}' > "$DOCKER_CONFIG/config.json"
+
+          # Symlink docker-compose plugin into our DOCKER_CONFIG
+          for src in \
+            /Applications/Docker.app/Contents/Resources/cli-plugins/docker-compose \
+            /opt/homebrew/lib/docker/cli-plugins/docker-compose \
+            /usr/local/lib/docker/cli-plugins/docker-compose; do
+            if [ -x "$src" ]; then
+              ln -sf "$src" "$DOCKER_CONFIG/cli-plugins/docker-compose"
+              break
+            fi
+          done
+
+          # Symlink docker-buildx plugin
+          for src in \
+            /Applications/Docker.app/Contents/Resources/cli-plugins/docker-buildx \
+            /opt/homebrew/lib/docker/cli-plugins/docker-buildx \
+            /usr/local/lib/docker/cli-plugins/docker-buildx; do
+            if [ -x "$src" ]; then
+              ln -sf "$src" "$DOCKER_CONFIG/cli-plugins/docker-buildx"
+              break
+            fi
+          done
+
+          # Shim docker-credential-osxkeychain — Docker auto-invokes it even
+          # without credsStore. Real one fails in launchd session (locked keychain).
+          # Our fake returns empty creds, which is correct for public Docker Hub images.
+          SHIM="$DOCKER_CONFIG/bin/docker-credential-osxkeychain"
+          : > "$SHIM"
+          echo '#!/bin/bash'                                                            >> "$SHIM"
+          echo 'case "$1" in'                                                            >> "$SHIM"
+          echo '  list) echo "{}" ;;'                                                    >> "$SHIM"
+          echo '  get)  echo "{\"ServerURL\":\"\",\"Username\":\"\",\"Secret\":\"\"}" ;;' >> "$SHIM"
+          echo '  *)    cat > /dev/null ;;'                                              >> "$SHIM"
+          echo 'esac'                                                                    >> "$SHIM"
+          echo 'exit 0'                                                                  >> "$SHIM"
+          chmod +x "$SHIM"
+
+          # Prepend shim dir so Docker uses our fake helper, not the system one
+          export PATH="$DOCKER_CONFIG/bin:$PATH"
+
+          # Open log file
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          LOG="$HOME/portals/logs/deploy/$PORTAL-$TIMESTAMP.log"
+          mkdir -p "$(dirname "$LOG")"
+          exec > >(tee -a "$LOG") 2>&1
+
+          echo "═══ Deploy started: $(date) ═══"
+          echo "Portal:   $PORTAL"
+          echo "Repo:     $GITHUB_REPOSITORY"
+          echo "Commit:   $GITHUB_SHA"
+          echo "Pusher:   $GITHUB_ACTOR"
+          echo "Trigger:  $GITHUB_EVENT_NAME"
+          echo "Services: $SERVICES"
+          echo "Health:   $HEALTH_URL"
+          echo ""
+
+          echo "─── 1/4 Pulling latest code ───"
+          cd "$HOME/portals/$PORTAL_DIR"
+          git fetch origin main
+          git reset --hard origin/main
+          git log -1 --pretty=format:"%h %s (%cr)"
+          echo ""
+
+          echo ""
+          echo "─── 2/4 Rebuilding services ───"
+          cd "$HOME/portals"
+          docker compose up -d --build $SERVICES
+
+          echo ""
+          echo "─── 3/4 Waiting 15s for services to come up ───"
+          sleep 15
+
+          echo ""
+          echo "─── 4/4 Health check ($HEALTH_URL) ───"
+          for i in 1 2 3; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL")
+            if [ "$CODE" = "200" ] || [ "$CODE" = "301" ] || [ "$CODE" = "302" ]; then
+              echo "✅ Health check passed (attempt $i, HTTP $CODE)"
+              echo "═══ Deploy SUCCESS: $(date) ═══"
+              exit 0
+            fi
+            echo "  attempt $i: HTTP $CODE — retrying in 5s..."
+            sleep 5
+          done
+
+          echo "❌ Health check failed after 3 attempts"
+          echo "═══ Deploy FAILED: $(date) ═══"
+          exit 1
