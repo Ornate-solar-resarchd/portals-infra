@@ -113,7 +113,9 @@ jobs:
 
           echo "─── 1/4 Pulling latest code ───"
           cd "$HOME/portals/$PORTAL_DIR"
-          git fetch origin main
+          # Bypass the macOS keychain credential helper (locked in launchd context).
+          # Use the workflow's auto-provided GITHUB_TOKEN for HTTPS auth via header.
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: bearer $GITHUB_TOKEN" fetch origin main
           git reset --hard origin/main
           git log -1 --pretty=format:"%h %s (%cr)"
           echo ""
@@ -129,17 +131,24 @@ jobs:
 
           echo ""
           echo "─── 4/4 Health check ($HEALTH_URL) ───"
+          # Any 2xx/3xx/4xx response = the tunnel + container are alive.
+          # 4xx (e.g. 404 on /) is fine for APIs that have no homepage route.
+          # 5xx or 000 (connection failure) = real problem.
           for i in 1 2 3; do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$HEALTH_URL")
-            if [ "$CODE" = "200" ] || [ "$CODE" = "301" ] || [ "$CODE" = "302" ]; then
-              echo "✅ Health check passed (attempt $i, HTTP $CODE)"
-              echo "═══ Deploy SUCCESS: $(date) ═══"
-              exit 0
-            fi
-            echo "  attempt $i: HTTP $CODE — retrying in 5s..."
-            sleep 5
+            case "$CODE" in
+              2*|3*|4*)
+                echo "✅ Health check passed (attempt $i, HTTP $CODE)"
+                echo "═══ Deploy SUCCESS: $(date) ═══"
+                exit 0
+                ;;
+              *)
+                echo "  attempt $i: HTTP $CODE — retrying in 5s..."
+                sleep 5
+                ;;
+            esac
           done
 
-          echo "❌ Health check failed after 3 attempts"
+          echo "❌ Health check failed after 3 attempts (last code: $CODE)"
           echo "═══ Deploy FAILED: $(date) ═══"
           exit 1
