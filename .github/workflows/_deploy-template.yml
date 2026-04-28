@@ -46,6 +46,9 @@ jobs:
           PORTAL_DIR: ${{ inputs.portal_dir }}
           SERVICES: ${{ inputs.services }}
           HEALTH_URL: ${{ inputs.health_url }}
+          # Explicitly map auto-generated workflow token into shell env.
+          # Without this, $GITHUB_TOKEN is empty in reusable workflow steps.
+          GH_TOK: ${{ github.token }}
         run: |
           set -e
 
@@ -113,13 +116,15 @@ jobs:
 
           echo "─── 1/4 Pulling latest code ───"
           cd "$HOME/portals/$PORTAL_DIR"
-          # Bypass the macOS keychain credential helper (locked in launchd context).
-          # Same pattern actions/checkout uses: disable creds helper + send base64
-          # basic-auth header. Token comes from GITHUB_TOKEN auto-injected by Actions.
-          AUTH_B64=$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64)
-          git -c credential.helper= \
-              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $AUTH_B64" \
-              fetch origin main
+          # Build a short-lived askpass script (avoids putting token in process args).
+          # Token expires when this job ends — auto-rotated by GitHub.
+          ASKPASS=$(mktemp /tmp/askpass.XXXXXX)
+          chmod 700 "$ASKPASS"
+          printf '%s\n' '#!/bin/bash' 'case "$1" in' '  Username*) echo "x-access-token" ;;' '  Password*) echo "$GH_TOK" ;;' 'esac' > "$ASKPASS"
+          # Pass the token via env to the askpass script. Bypasses keychain.
+          GIT_ASKPASS="$ASKPASS" GIT_TERMINAL_PROMPT=0 GH_TOK="$GH_TOK" \
+            git -c credential.helper= fetch origin main
+          rm -f "$ASKPASS"
           git reset --hard origin/main
           git log -1 --pretty=format:"%h %s (%cr)"
           echo ""
